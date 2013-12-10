@@ -30,6 +30,7 @@ MODULE_LICENSE("GPL");
 
 static int pegatron_acpi_add(struct acpi_device*);
 static int pegatron_acpi_remove(struct acpi_device*);
+static void pegatron_acpi_notify(struct acpi_device*, u32);
 
 static const struct acpi_device_id pegatron_device_ids[] = {
 	{ PEGATRON_DEVICE_ID, 0 },
@@ -44,6 +45,7 @@ static struct acpi_driver pegatron_acpi_driver = {
 	.ops =			{
 						.add = pegatron_acpi_add,
 						.remove = pegatron_acpi_remove,
+						.notify = pegatron_acpi_notify,
 					},
 	.owner =		THIS_MODULE,
 };
@@ -69,7 +71,11 @@ static int pegatron_acpi_add(struct acpi_device *dev) {
 	return 0;
 }
 
-static int pegatron_acpi_remove(struct acpi_device *device){
+static void pegatron_acpi_notify(struct acpi_device *dev, u32 event) {
+	pr_info("[Pegatron] event found: 0x%.2x\n", event);
+}
+
+static int pegatron_acpi_remove(struct acpi_device *device) {
 	return 0;
 }
 
@@ -89,6 +95,7 @@ static int __init pegatron_acpi_init(void) {
 
 static void __exit pegatron_acpi_exit(void) {
 	pr_info("[Pegatron] Unloading ACPI/WMI device\n");
+	acpi_bus_unregister_driver(&pegatron_acpi_driver);
 }
 
 module_init(pegatron_acpi_init);
