@@ -27,14 +27,18 @@
 #define PEGATRON_DEVICE_ID "PTK0001"
 #define PEGATRON_FILE KBUILD_MODNAME
 
-#define PEGATRON_WMI_GUID "89142400-C6A3-40FA-BADB-8A2652834100"
+/*#define PEGATRON_WMI_GUID "49142401-C6A3-40FA-BADB-8A2652834100"*/
+/*#define PEGATRON_WMI_GUID "59142400-C6A3-40FA-BADB-8A2652834100"*/
+#define PEGATRON_WMI_GUID "79142400-C6A3-40FA-BADB-8A2652834100"
+#define PEGATRON_WMI_EVENT_GUID "59142400-C6A3-40FA-BADB-8A2652834100"
 
 
 MODULE_AUTHOR("Marco Antonio Benatto");
 MODULE_DESCRIPTION("Pegatron ACPI/WMI platform device driver");
 MODULE_LICENSE("GPL");
 
-MODULE_ALIAS("wmi:89142400-C6A3-40FA-BADB-8A2652834100");
+/*MODULE_ALIAS("wmi:89142400-C6A3-40FA-BADB-8A2652834100");*/
+MODULE_ALIAS("wmi:79142400-C6A3-40FA-BADB-8A2652834100");
 
 static int pegatron_acpi_add(struct acpi_device*);
 static int pegatron_acpi_remove(struct acpi_device*);
@@ -71,6 +75,10 @@ struct pegatron_laptop {
 	acpi_handle handle;	
 };
 
+
+struct bios_args {
+	u32 arg0;
+};
 
 /*
  * Pegatron ACPI driver information
@@ -109,7 +117,13 @@ static int pegatron_acpi_init(struct pegatron_laptop *pegatron) {
 		return -ENODEV;
 	}
 
-	status = acpi_execute_simple_method(pegatron->handle, "INIT", 0x55AA66BB);
+	status = acpi_execute_simple_method(pegatron->handle, "INIT", 0x55AA66BC);
+	if (ACPI_FAILURE(status)){
+		dev_err(&pegatron->dev->dev, "[Pegatron] error calling ACPI INIT method\n");
+		return -ENODEV;
+	}
+
+	status = acpi_execute_simple_method(pegatron->handle, "NTFY", 0x02);
 	if (ACPI_FAILURE(status)){
 		dev_err(&pegatron->dev->dev, "[Pegatron] error calling ACPI INIT method\n");
 		return -ENODEV;
@@ -221,8 +235,11 @@ static int pegatron_acpi_add(struct acpi_device *dev) {
 static void pegatron_input_notify(struct pegatron_laptop *pegatron, int event) {
 		if (!pegatron->inputdev)
 				return;
-		if (!sparse_keymap_report_event(pegatron->inputdev, event, 1, true))
+		if (!sparse_keymap_report_event(pegatron->inputdev, event, 1, true)) {
 				pr_info("[Pegatron] Unknown key %x pressed\n", event);
+		}else{
+				pr_info("[Pegatron] to be done in input notify\n");
+		}
 }
 
 static void pegatron_acpi_notify(struct acpi_device *dev, u32 event) {
@@ -272,11 +289,31 @@ static int pegatron_acpi_remove(struct acpi_device *dev) {
 	return 0;
 }
 
+
+static int pegatron_start_wmi(void) {
+		struct bios_args args = {
+			.arg0 = 0x1,
+		};
+
+		struct acpi_buffer input = { (acpi_size) sizeof(args), &args };
+		struct acpi_buffer output = { ACPI_ALLOCATE_BUFFER, NULL };
+		acpi_status status;
+
+		status = wmi_evaluate_method(PEGATRON_WMI_GUID, 0x01, 0x06, &input, &output);
+
+		if (ACPI_FAILURE(status)) {
+			pr_err("[Pegatron] unable to find this method\n");
+			return -1;
+		}
+
+		return 0;
+}
+
 static int __init pegatron_laptop_init(void) {
 	int result = 0;
 	acpi_status status = AE_OK;
 
-	pr_info("[Pegatron] ACPI/WMI module loaded\n");
+	pr_info("[Pegatron] ACPI/WMI module loaded(GUID: %s)\n", PEGATRON_WMI_GUID);
 
 	result = platform_driver_register(&platform_driver);
 	if (result < 0)
@@ -304,7 +341,15 @@ static int __init pegatron_laptop_init(void) {
 		pr_err("[Pegatron] Error installing notify handler. Exiting...\n");
 		return -EIO;
 	}
+
+	status = wmi_install_notify_handler(PEGATRON_WMI_EVENT_GUID, pegatron_notify_handler, NULL);
+	if(ACPI_FAILURE(status)) {
+		pr_err("[Pegatron] Error installing event notify handler. Exiting...\n");
+		return -EIO;
+	}
 	
+	pegatron_start_wmi();
+
 	pr_info("[Pegatron] Module initialized successfully\n");
 	return 0;
 }
@@ -314,6 +359,8 @@ static void __exit pegatron_acpi_exit(void) {
 	acpi_bus_unregister_driver(&pegatron_acpi_driver);
 	platform_driver_unregister(&platform_driver);
 	wmi_remove_notify_handler(PEGATRON_WMI_GUID);
+	wmi_remove_notify_handler(PEGATRON_WMI_EVENT_GUID);
+
 }
 
 module_init(pegatron_laptop_init);
