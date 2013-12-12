@@ -20,17 +20,21 @@
 #include <linux/printk.h>
 #include <linux/input.h>
 #include <linux/input/sparse-keymap.h>
-#include <linux/input-polldev.h>
+#include <linux/platform_device.h>
 #include <acpi/acpi_bus.h>
 #include <acpi/acpi_drivers.h>
 
 #define PEGATRON_DEVICE_ID "PTK0001"
 #define PEGATRON_FILE KBUILD_MODNAME
 
+#define PEGATRON_WMI_GUID "89142400-C6A3-40FA-BADB-8A2652834100"
+
 
 MODULE_AUTHOR("Marco Antonio Benatto");
 MODULE_DESCRIPTION("Pegatron ACPI/WMI platform device driver");
 MODULE_LICENSE("GPL");
+
+MODULE_ALIAS("wmi:89142400-C6A3-40FA-BADB-8A2652834100");
 
 static int pegatron_acpi_add(struct acpi_device*);
 static int pegatron_acpi_remove(struct acpi_device*);
@@ -49,6 +53,7 @@ static const struct key_entry pegatron_keymap[] = {
 	{KE_KEY, 0xf1, {KEY_WLAN} }, /* WLAN on/off hotkey */
 	{KE_KEY, 0xf3, {KEY_PROG2} }, /* Smart battery hotkey */
 	{KE_KEY, 0xf8, {KEY_TOUCHPAD_TOGGLE} }, /* TouchPad lock hotkey */
+	{KE_END, 0},
 };
 
 /*
@@ -75,12 +80,20 @@ static struct acpi_driver pegatron_acpi_driver = {
 	.name =			"Pegatron ACPI",
 	.class = 		"Pegatron",
 	.ids = 			pegatron_device_ids,
+	.flags =		ACPI_DRIVER_ALL_NOTIFY_EVENTS,
 	.ops =			{
 						.add = pegatron_acpi_add,
 						.remove = pegatron_acpi_remove,
 						.notify = pegatron_acpi_notify,
 					},
 	.owner =		THIS_MODULE,
+};
+
+static struct platform_driver platform_driver = {
+		.driver = {
+			.name = PEGATRON_FILE,
+			.owner = THIS_MODULE,
+		},
 };
 
 
@@ -205,8 +218,44 @@ static int pegatron_acpi_add(struct acpi_device *dev) {
 	return result;
 }
 
+static void pegatron_input_notify(struct pegatron_laptop *pegatron, int event) {
+		if (!pegatron->inputdev)
+				return;
+		if (!sparse_keymap_report_event(pegatron->inputdev, event, 1, true))
+				pr_info("[Pegatron] Unknown key %x pressed\n", event);
+}
+
 static void pegatron_acpi_notify(struct acpi_device *dev, u32 event) {
-	pr_info("[Pegatron] event found: 0x%.2x\n", event);
+		struct pegatron_laptop *pegatron = acpi_driver_data(dev);
+		pr_info("[Pegatron] event triggered: %x\n", event);
+
+		pegatron_input_notify(pegatron, event);
+}
+
+static void pegatron_notify_handler(u32 value, void *context) {
+		struct acpi_buffer response = { ACPI_ALLOCATE_BUFFER, NULL };
+		union acpi_object *obj;
+		acpi_status status;
+		int code;
+
+		pr_info("[Pegatron] event received\n");
+
+		status = wmi_get_event_data(value, &response);
+
+		if (status != AE_OK) {
+			pr_err("[Pegatron] bad event status 0x%x\n", status);
+			return;
+		}
+
+		obj = (union acpi_object*)response.pointer;
+
+		if (obj && obj->type == ACPI_TYPE_INTEGER) {
+			code = obj->integer.value;
+			
+			pr_info("[Pegatron] received key event: %x\n", code);
+		}
+
+		kfree(obj);
 }
 
 static int pegatron_acpi_remove(struct acpi_device *dev) {
@@ -225,21 +274,46 @@ static int pegatron_acpi_remove(struct acpi_device *dev) {
 
 static int __init pegatron_laptop_init(void) {
 	int result = 0;
+	acpi_status status = AE_OK;
 
 	pr_info("[Pegatron] ACPI/WMI module loaded\n");
+
+	result = platform_driver_register(&platform_driver);
+	if (result < 0)
+			return result;
 
 	result = acpi_bus_register_driver(&pegatron_acpi_driver);
 	if (result < 0) {
 		pr_err("[Pegatron] Could not insert Pegatron device driver. Exiting...\n");
+		platform_driver_unregister(&platform_driver);
 		return -ENODEV;
 	}
+
+	pr_info("[Pegatron] Checking for WMI GUID information\n");
+
+	if (!wmi_has_guid(PEGATRON_WMI_GUID)) {
+		pr_err("[Pegatron] WMI information doesn't match. Exiting...\n");
+		return -ENODEV;
+	}
+
+	pr_info("[Pegatron] Installing WMI event handler\n");
+
+	status = wmi_install_notify_handler(PEGATRON_WMI_GUID, pegatron_notify_handler, NULL);
+
+	if(ACPI_FAILURE(status)) {
+		pr_err("[Pegatron] Error installing notify handler. Exiting...\n");
+		return -EIO;
+	}
 	
+	pr_info("[Pegatron] Module initialized successfully\n");
 	return 0;
 }
 
 static void __exit pegatron_acpi_exit(void) {
 	pr_info("[Pegatron] Unloading ACPI/WMI device\n");
 	acpi_bus_unregister_driver(&pegatron_acpi_driver);
+	platform_driver_unregister(&platform_driver);
+	wmi_remove_notify_handler(PEGATRON_WMI_GUID);
 }
 
 module_init(pegatron_laptop_init);
