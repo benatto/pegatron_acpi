@@ -18,6 +18,7 @@
 #include <linux/init.h>
 #include <linux/types.h>
 #include <linux/printk.h>
+#include <linux/rfkill.h>
 #include <linux/input.h>
 #include <linux/input/sparse-keymap.h>
 #include <linux/platform_device.h>
@@ -27,17 +28,17 @@
 #define PEGATRON_DEVICE_ID "PTK0001"
 #define PEGATRON_FILE KBUILD_MODNAME
 
-/*#define PEGATRON_WMI_GUID "49142401-C6A3-40FA-BADB-8A2652834100"*/
-/*#define PEGATRON_WMI_GUID "59142400-C6A3-40FA-BADB-8A2652834100"*/
 #define PEGATRON_WMI_GUID "79142400-C6A3-40FA-BADB-8A2652834100"
 #define PEGATRON_WMI_EVENT_GUID "59142400-C6A3-40FA-BADB-8A2652834100"
+
+
+#define PEGATRON_WLAN_EVENT 88
 
 
 MODULE_AUTHOR("Marco Antonio Benatto");
 MODULE_DESCRIPTION("Pegatron ACPI/WMI platform device driver");
 MODULE_LICENSE("GPL");
 
-/*MODULE_ALIAS("wmi:89142400-C6A3-40FA-BADB-8A2652834100");*/
 MODULE_ALIAS("wmi:79142400-C6A3-40FA-BADB-8A2652834100");
 
 static int pegatron_acpi_add(struct acpi_device*);
@@ -60,6 +61,16 @@ static const struct key_entry pegatron_keymap[] = {
 	{KE_END, 0},
 };
 
+
+/*
+ * Wlan rfkill information
+ */
+struct pegatron_rfkill_info {
+	struct rfkill *rfkill;
+	u32 dev_id;
+	int status;
+};
+
 /*
  * Pegatron laptop information
  */
@@ -70,12 +81,17 @@ struct pegatron_laptop {
 	struct input_dev *inputdev; /* Pegatron input device */
 	struct key_entry *keymap; /* Pegatron hotkeys sparse keymap */
 
-	int wlan_status; /* WLAN card status (1: ON, 0: OFF) */
-
 	acpi_handle handle;	
+
+	struct pegatron_rfkill_info wlan_rfkill; /* wlan rfkill information */
+
+	struct mutex hotplug_lock; 
+	struct mutex wmi_lock;
 };
 
-
+/*
+ * BIOS argument struct
+ */
 struct bios_args {
 	u32 arg0;
 };
@@ -175,6 +191,17 @@ static int pegatron_input_init(struct pegatron_laptop *pegatron) {
 	return 0;
 }
 
+static int pegatron_rfkill_init(struct pegatron_laptop *pegatron) {
+	int result = 0;
+
+	mutex_init(&pegatron->hotplug_lock);
+	mutex_init(&pegatron->wmi_lock);
+
+	/* TODO: start rfkill and free both mutexes */
+
+}
+
+
 /*****************************************************************************/
 
 
@@ -194,9 +221,12 @@ static void pegatron_input_exit(struct pegatron_laptop *pegatron) {
 
 /*****************************************************************************/
 
+
+/*
+ * MISC functions
+ */
+
 static int pegatron_acpi_add(struct acpi_device *dev) {
-	/* We should call INIT function from acpi sending 0x55AA66BB
-	 * as arg0 following Pegatron ACPI spec */
 	struct pegatron_laptop *pegatron;
 	int result;
 
@@ -232,13 +262,56 @@ static int pegatron_acpi_add(struct acpi_device *dev) {
 	return result;
 }
 
+static int pegatron_query_hotkey(const struct pegatron_laptop* pegatron
+				, const int event, unsigned int *scancode) {
+
+	acpi_status status = AE_OK;
+	unsigned long long *data = kzalloc(sizeof(unsigned long long int),
+									  GFP_KERNEL);
+
+	if (!data) {
+		dev_err(&pegatron->dev->dev, "[Pegatron] No memory enough\n");
+		return -ENOMEM;
+	}
+
+	if (!acpi_has_method(pegatron->handle, "WQ00")) {
+		dev_err(&pegatron->dev->dev,
+				"[Pegatron] Could not find required function in ACPI table\n");
+		kfree(data);
+		return -ENODEV;
+	}
+
+	status = acpi_evaluate_integer(pegatron->handle, "WQ00", NULL, data);
+
+	if (ACPI_FAILURE(status)){
+		dev_err(&pegatron->dev->dev, "[Pegatron] error calling ACPI INIT method\n");
+		kfree(data);
+		return -ENODEV;
+	}
+
+	*scancode = *(data);
+
+	pr_info("[Pegatron] Event scancode: 0x%x\n", *scancode);
+
+	kfree(data);
+
+	return 0;
+}
+
 static void pegatron_input_notify(struct pegatron_laptop *pegatron, int event) {
 		if (!pegatron->inputdev)
 				return;
-		if (!sparse_keymap_report_event(pegatron->inputdev, event, 1, true)) {
-				pr_info("[Pegatron] Unknown key %x pressed\n", event);
-		}else{
-				pr_info("[Pegatron] to be done in input notify\n");
+
+		switch (event){
+			case PEGATRON_WLAN_EVENT:
+
+				break;
+			default:
+				if (!sparse_keymap_report_event(pegatron->inputdev, event, 1, true)) {
+						pr_info("[Pegatron] Unknown key %x pressed\n", event);
+				}else{
+						pr_info("[Pegatron] to be done in input notify\n");
+				}
 		}
 }
 
@@ -254,6 +327,8 @@ static void pegatron_notify_handler(u32 value, void *context) {
 		union acpi_object *obj;
 		acpi_status status;
 		int code;
+		unsigned int key_value = 1;
+		/*struct pegatron_laptop *laptop = */
 
 		pr_info("[Pegatron] event received\n");
 
@@ -270,6 +345,16 @@ static void pegatron_notify_handler(u32 value, void *context) {
 			code = obj->integer.value;
 			
 			pr_info("[Pegatron] received key event: %x\n", code);
+
+		}
+
+		switch (code) {
+			case PEGATRON_WLAN_EVENT:
+				pr_info("[Pegatron] wlan event received\n");
+				break;
+			default:
+				pr_info("[Pegatron] operation not implemented yet\n");
+				break;
 		}
 
 		kfree(obj);
@@ -308,6 +393,16 @@ static int pegatron_start_wmi(void) {
 
 		return 0;
 }
+
+static int pegatron_setup_rfkill(struct pegatron_laptop *pegatron,
+								 const char *name, enum rfkill_type type,
+								 int dev_id) {
+	
+}
+
+
+/*****************************************************************************/
+
 
 static int __init pegatron_laptop_init(void) {
 	int result = 0;
