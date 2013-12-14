@@ -32,7 +32,10 @@
 #define PEGATRON_WMI_EVENT_GUID "59142400-C6A3-40FA-BADB-8A2652834100"
 
 
-#define PEGATRON_WLAN_EVENT 88
+#define PEGATRON_WLAN_EVENT 0x88
+
+/* WLAN status on ACPI function */
+#define PEGATRON_ACPI_WLAN_ST "HSWC"
 
 
 MODULE_AUTHOR("Marco Antonio Benatto");
@@ -61,6 +64,10 @@ static const struct key_entry pegatron_keymap[] = {
 	{KE_END, 0},
 };
 
+enum pegatron_wlan_led_status {
+	PEGATRON_WLAN_LED_OFF = 0x0,
+	PEGATRON_WLAN_LED_ON = 0x1
+};
 
 /*
  * Wlan rfkill information
@@ -225,6 +232,42 @@ static void pegatron_input_exit(struct pegatron_laptop *pegatron) {
 /*
  * MISC functions
  */
+static int pegatron_wlan_set_status(struct pegatron_laptop *pegatron,
+									enum pegatron_wlan_led_status led_status) {
+	acpi_status status;
+	union acpi_object obj[1];
+	struct acpi_object_list args;
+	unsigned long long error;
+
+	obj[0].type = ACPI_TYPE_INTEGER;
+	obj[0].integer.value = led_status;  /* query value defined into DSDT */
+
+	args.count = 1;
+	args.pointer = obj;
+
+	if (!acpi_has_method(pegatron->handle, PEGATRON_ACPI_WLAN_ST)) {
+		dev_err(&pegatron->dev->dev,
+				"[Pegatron] Unable to evaluate WLAN status\n");
+		return -ENODEV;
+	}
+
+	status = acpi_evaluate_integer(pegatron->handle, PEGATRON_ACPI_WLAN_ST,
+								   &args, &error);
+
+	if (ACPI_FAILURE(status)) {
+		dev_err(&pegatron->dev->dev, 
+				"[Pegatron] Error trying to evaluate WLAN status\n");
+		return -EIO;
+	}
+
+	if (error) {
+		dev_err(&pegatron->dev->dev,
+				"[Pegatron] Error trying to set WLAN led status\n");
+		return -EIO;
+	}
+	
+	return 0;
+}
 
 static int pegatron_acpi_add(struct acpi_device *dev) {
 	struct pegatron_laptop *pegatron;
@@ -298,13 +341,22 @@ static int pegatron_query_hotkey(const struct pegatron_laptop* pegatron
 	return 0;
 }
 
-static void pegatron_input_notify(struct pegatron_laptop *pegatron, int event) {
+static void pegatron_input_notify(struct pegatron_laptop *pegatron, u32 event) {
+		int wlan_on = -1;
 		if (!pegatron->inputdev)
 				return;
 
 		switch (event){
 			case PEGATRON_WLAN_EVENT:
-
+				if (pegatron->wlan_rfkill.status == 1){
+					pegatron_wlan_set_status(pegatron, PEGATRON_WLAN_LED_OFF);
+					pegatron->wlan_rfkill.status = 0;
+				}else{
+					pegatron_wlan_set_status(pegatron, PEGATRON_WLAN_LED_ON);
+					pegatron->wlan_rfkill.status = 1;
+				}
+							
+				pr_info("[Pegatron] WLAN status = %d\n", wlan_on);
 				break;
 			default:
 				if (!sparse_keymap_report_event(pegatron->inputdev, event, 1, true)) {
@@ -312,6 +364,7 @@ static void pegatron_input_notify(struct pegatron_laptop *pegatron, int event) {
 				}else{
 						pr_info("[Pegatron] to be done in input notify\n");
 				}
+				break;
 		}
 }
 
@@ -397,9 +450,12 @@ static int pegatron_start_wmi(void) {
 static int pegatron_setup_rfkill(struct pegatron_laptop *pegatron,
 								 const char *name, enum rfkill_type type,
 								 int dev_id) {
-	
+	/* TODO: start rfkill struct here */	
 }
 
+static void pegatron_rfkill_query(struct rfkill *rkfill, void *data) {
+
+}
 
 /*****************************************************************************/
 
