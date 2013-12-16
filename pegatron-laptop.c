@@ -47,6 +47,7 @@ MODULE_ALIAS("wmi:79142400-C6A3-40FA-BADB-8A2652834100");
 static int pegatron_acpi_add(struct acpi_device*);
 static int pegatron_acpi_remove(struct acpi_device*);
 static void pegatron_acpi_notify(struct acpi_device*, u32);
+static int pegatron_wlan_rfkill_set_block(void*, bool);
 
 static const struct acpi_device_id pegatron_device_ids[] = {
 	{ PEGATRON_DEVICE_ID, 0 },
@@ -128,6 +129,11 @@ static struct platform_driver platform_driver = {
 };
 
 
+static const struct rfkill_ops pegatron_rfk_ops = {
+	.set_block = pegatron_wlan_rfkill_set_block,
+};
+
+
 /*
  * init functions
  */
@@ -201,11 +207,32 @@ static int pegatron_input_init(struct pegatron_laptop *pegatron) {
 static int pegatron_rfkill_init(struct pegatron_laptop *pegatron) {
 	int result = 0;
 
-	mutex_init(&pegatron->hotplug_lock);
-	mutex_init(&pegatron->wmi_lock);
+	pegatron->wlan_rfkill.rfkill = rfkill_alloc("phy0",
+												&pegatron->dev->dev,
+												RFKILL_TYPE_WLAN,
+												&pegatron_rfk_ops,
+												pegatron);
 
-	/* TODO: start rfkill and free both mutexes */
+	if (!pegatron->wlan_rfkill.rfkill) {
+		dev_err(&pegatron->dev->dev, "[Pegatron] Error allocating rfkill \
+									  device\n");
+		return -ENOMEM;
+	}
 
+	
+	rfkill_init_sw_state(pegatron->wlan_rfkill.rfkill, true);
+	rfkill_set_hw_state(pegatron->wlan_rfkill.rfkill, true);
+
+	pr_info("[Pegatron] Trying to register rfkill driver\n");
+	result = rfkill_register(pegatron->wlan_rfkill.rfkill);
+
+	if (result < 0) {
+		dev_err(&pegatron->dev->dev, "[Pegatron] failed to register rfkill driver: %d\n", result);
+		rfkill_destroy(pegatron->wlan_rfkill.rfkill);
+		return result;
+	}
+
+	return 0;
 }
 
 
@@ -238,6 +265,7 @@ static int pegatron_wlan_set_status(struct pegatron_laptop *pegatron,
 	union acpi_object obj[1];
 	struct acpi_object_list args;
 	unsigned long long error;
+	bool *changed;
 
 	obj[0].type = ACPI_TYPE_INTEGER;
 	obj[0].integer.value = led_status;  /* query value defined into DSDT */
@@ -251,6 +279,15 @@ static int pegatron_wlan_set_status(struct pegatron_laptop *pegatron,
 		return -ENODEV;
 	}
 
+	
+	rfkill_set_hw_state(pegatron->wlan_rfkill.rfkill,
+				   		led_status == PEGATRON_WLAN_LED_ON ? true : false);
+					   	
+
+	rfkill_set_sw_state(pegatron->wlan_rfkill.rfkill,
+				   		led_status == PEGATRON_WLAN_LED_ON ? true : false);
+
+
 	status = acpi_evaluate_integer(pegatron->handle, PEGATRON_ACPI_WLAN_ST,
 								   &args, &error);
 
@@ -262,7 +299,7 @@ static int pegatron_wlan_set_status(struct pegatron_laptop *pegatron,
 
 	if (error) {
 		dev_err(&pegatron->dev->dev,
-				"[Pegatron] Error trying to set WLAN led status\n");
+			"[Pegatron] Error trying to set WLAN led status\n");
 		return -EIO;
 	}
 	
@@ -300,8 +337,15 @@ static int pegatron_acpi_add(struct acpi_device *dev) {
 		kfree(pegatron);
 		return result;
 	}
-	
 
+	/* Initializing rfkill switches*/
+	result = pegatron_rfkill_init(pegatron);
+
+	if (result) {
+		kfree(pegatron);
+		return result;
+	}
+	
 	return result;
 }
 
@@ -380,7 +424,6 @@ static void pegatron_notify_handler(u32 value, void *context) {
 		union acpi_object *obj;
 		acpi_status status;
 		int code;
-		unsigned int key_value = 1;
 		/*struct pegatron_laptop *laptop = */
 
 		pr_info("[Pegatron] event received\n");
@@ -422,6 +465,9 @@ static int pegatron_acpi_remove(struct acpi_device *dev) {
 
 	pegatron_input_exit(pegatron);
 
+	pr_info("[Pegatron] unregistering rfkill switches\n");
+	rfkill_unregister(pegatron->wlan_rfkill.rfkill);
+
 	kfree(pegatron);
 	
 	return 0;
@@ -447,14 +493,16 @@ static int pegatron_start_wmi(void) {
 		return 0;
 }
 
-static int pegatron_setup_rfkill(struct pegatron_laptop *pegatron,
-								 const char *name, enum rfkill_type type,
-								 int dev_id) {
-	/* TODO: start rfkill struct here */	
-}
-
 static void pegatron_rfkill_query(struct rfkill *rkfill, void *data) {
 
+}
+
+static int pegatron_wlan_rfkill_set_block(void *data, bool blocked) {
+	pr_info("Benatto: set block called\n");
+	if (blocked)
+		return pegatron_wlan_set_status((struct pegatron_laptop*)data, PEGATRON_WLAN_LED_OFF);
+	else
+		return pegatron_wlan_set_status((struct pegatron_laptop*)data, PEGATRON_WLAN_LED_ON);
 }
 
 /*****************************************************************************/
