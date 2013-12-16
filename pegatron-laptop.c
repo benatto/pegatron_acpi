@@ -65,10 +65,11 @@ static const struct key_entry pegatron_keymap[] = {
 	{KE_END, 0},
 };
 
-enum pegatron_wlan_led_status {
+typedef enum pegatron_wlan_led_status {
 	PEGATRON_WLAN_LED_OFF = 0x0,
 	PEGATRON_WLAN_LED_ON = 0x1
-};
+}pegatron_wlan_led_status;
+
 
 /*
  * Wlan rfkill information
@@ -103,6 +104,8 @@ struct pegatron_laptop {
 struct bios_args {
 	u32 arg0;
 };
+
+static int pegatron_wlan_set_status(struct pegatron_laptop *, pegatron_wlan_led_status);
 
 /*
  * Pegatron ACPI driver information
@@ -207,7 +210,7 @@ static int pegatron_input_init(struct pegatron_laptop *pegatron) {
 static int pegatron_rfkill_init(struct pegatron_laptop *pegatron) {
 	int result = 0;
 
-	pegatron->wlan_rfkill.rfkill = rfkill_alloc("phy0",
+	pegatron->wlan_rfkill.rfkill = rfkill_alloc("Pegatron WLAN",
 												&pegatron->dev->dev,
 												RFKILL_TYPE_WLAN,
 												&pegatron_rfk_ops,
@@ -220,8 +223,10 @@ static int pegatron_rfkill_init(struct pegatron_laptop *pegatron) {
 	}
 
 	
-	rfkill_init_sw_state(pegatron->wlan_rfkill.rfkill, true);
-	rfkill_set_hw_state(pegatron->wlan_rfkill.rfkill, true);
+	/*rfkill_init_sw_state(pegatron->wlan_rfkill.rfkill, true);
+	rfkill_set_hw_state(pegatron->wlan_rfkill.rfkill, true);*/
+
+	pegatron_wlan_set_status(pegatron, PEGATRON_WLAN_LED_ON);
 
 	pr_info("[Pegatron] Trying to register rfkill driver\n");
 	result = rfkill_register(pegatron->wlan_rfkill.rfkill);
@@ -231,6 +236,8 @@ static int pegatron_rfkill_init(struct pegatron_laptop *pegatron) {
 		rfkill_destroy(pegatron->wlan_rfkill.rfkill);
 		return result;
 	}
+
+	pr_info("[Pegatron] rfkill driver registered successfully\n");
 
 	return 0;
 }
@@ -498,7 +505,7 @@ static void pegatron_rfkill_query(struct rfkill *rkfill, void *data) {
 }
 
 static int pegatron_wlan_rfkill_set_block(void *data, bool blocked) {
-	pr_info("Benatto: set block called\n");
+	pr_info("Benatto: set block called, blocked: %s\n", blocked ? "true" : "false");
 	if (blocked)
 		return pegatron_wlan_set_status((struct pegatron_laptop*)data, PEGATRON_WLAN_LED_OFF);
 	else
