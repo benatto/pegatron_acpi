@@ -223,10 +223,12 @@ static int pegatron_rfkill_init(struct pegatron_laptop *pegatron) {
 	}
 
 	
-	/*rfkill_init_sw_state(pegatron->wlan_rfkill.rfkill, true);
-	rfkill_set_hw_state(pegatron->wlan_rfkill.rfkill, true);*/
+	/* We start WLAN switches as both unblocked by default */
+	rfkill_init_sw_state(pegatron->wlan_rfkill.rfkill, false);
+	rfkill_set_hw_state(pegatron->wlan_rfkill.rfkill, false);
 
-	pegatron_wlan_set_status(pegatron, PEGATRON_WLAN_LED_ON);
+	/* Set control variable from WLAN as "ON" */
+	pegatron->wlan_rfkill.status = 1;
 
 	pr_info("[Pegatron] Trying to register rfkill driver\n");
 	result = rfkill_register(pegatron->wlan_rfkill.rfkill);
@@ -272,7 +274,6 @@ static int pegatron_wlan_set_status(struct pegatron_laptop *pegatron,
 	union acpi_object obj[1];
 	struct acpi_object_list args;
 	unsigned long long error;
-	bool *changed;
 
 	obj[0].type = ACPI_TYPE_INTEGER;
 	obj[0].integer.value = led_status;  /* query value defined into DSDT */
@@ -286,14 +287,12 @@ static int pegatron_wlan_set_status(struct pegatron_laptop *pegatron,
 		return -ENODEV;
 	}
 
-	
+	/* rfkill functions works on the other hand of this function logic
+	 * so if we set led to ON we need to set block to false and vice-versa
+	 */
 	rfkill_set_hw_state(pegatron->wlan_rfkill.rfkill,
-				   		led_status == PEGATRON_WLAN_LED_ON ? true : false);
+				   		led_status == PEGATRON_WLAN_LED_ON ? false : true);
 					   	
-
-	rfkill_set_sw_state(pegatron->wlan_rfkill.rfkill,
-				   		led_status == PEGATRON_WLAN_LED_ON ? true : false);
-
 
 	status = acpi_evaluate_integer(pegatron->handle, PEGATRON_ACPI_WLAN_ST,
 								   &args, &error);
@@ -310,6 +309,9 @@ static int pegatron_wlan_set_status(struct pegatron_laptop *pegatron,
 		return -EIO;
 	}
 	
+
+	pegatron->wlan_rfkill.status = (int)led_status;
+
 	return 0;
 }
 
@@ -401,13 +403,9 @@ static void pegatron_input_notify(struct pegatron_laptop *pegatron, u32 event) {
 			case PEGATRON_WLAN_EVENT:
 				if (pegatron->wlan_rfkill.status == 1){
 					pegatron_wlan_set_status(pegatron, PEGATRON_WLAN_LED_OFF);
-					pegatron->wlan_rfkill.status = 0;
 				}else{
 					pegatron_wlan_set_status(pegatron, PEGATRON_WLAN_LED_ON);
-					pegatron->wlan_rfkill.status = 1;
 				}
-							
-				pr_info("[Pegatron] WLAN status = %d\n", wlan_on);
 				break;
 			default:
 				if (!sparse_keymap_report_event(pegatron->inputdev, event, 1, true)) {
@@ -505,11 +503,15 @@ static void pegatron_rfkill_query(struct rfkill *rkfill, void *data) {
 }
 
 static int pegatron_wlan_rfkill_set_block(void *data, bool blocked) {
-	pr_info("Benatto: set block called, blocked: %s\n", blocked ? "true" : "false");
-	if (blocked)
-		return pegatron_wlan_set_status((struct pegatron_laptop*)data, PEGATRON_WLAN_LED_OFF);
-	else
-		return pegatron_wlan_set_status((struct pegatron_laptop*)data, PEGATRON_WLAN_LED_ON);
+	struct pegatron_laptop *pegatron = data;
+
+	if (blocked) {
+		pegatron->wlan_rfkill.status = 0;
+		return pegatron_wlan_set_status(pegatron, PEGATRON_WLAN_LED_OFF);
+	}else{
+		pegatron->wlan_rfkill.status = 1;
+		return pegatron_wlan_set_status(pegatron, PEGATRON_WLAN_LED_ON);
+	}
 }
 
 /*****************************************************************************/
