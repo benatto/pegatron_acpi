@@ -48,6 +48,7 @@ static int pegatron_acpi_add(struct acpi_device*);
 static int pegatron_acpi_remove(struct acpi_device*);
 static void pegatron_acpi_notify(struct acpi_device*, u32);
 static int pegatron_wlan_rfkill_set_block(void*, bool);
+static void pegatron_notify_handler(u32, void *);
 
 static const struct acpi_device_id pegatron_device_ids[] = {
 	{ PEGATRON_DEVICE_ID, 0 },
@@ -60,8 +61,8 @@ MODULE_DEVICE_TABLE(acpi, pegatron_device_ids);
  */
 static const struct key_entry pegatron_keymap[] = {
 	{KE_KEY, 0xf1, {KEY_WLAN} }, /* WLAN on/off hotkey */
-	{KE_KEY, 0xf3, {KEY_PROG2} }, /* Smart battery hotkey */
-	{KE_KEY, 0xf8, {KEY_TOUCHPAD_TOGGLE} }, /* TouchPad lock hotkey */
+	{KE_KEY, 0x102, {KEY_PROG2} }, /* Smart battery hotkey */
+	{KE_KEY, 0x103, {KEY_TOUCHPAD_TOGGLE} }, /* TouchPad lock hotkey */
 	{KE_END, 0},
 };
 
@@ -137,12 +138,41 @@ static const struct rfkill_ops pegatron_rfk_ops = {
 };
 
 
+static int pegatron_install_wmi_handlers(struct pegatron_laptop *pegatron) {
+	acpi_status status;
+
+	pr_info("[Pegatron] Installing WMI notify handlers...\n");
+
+	status = wmi_install_notify_handler(PEGATRON_WMI_GUID, pegatron_notify_handler, pegatron);
+
+	if(ACPI_FAILURE(status)) {
+		pr_err("[Pegatron] Error installing notify handleri for GUID: %s\
+						. Exiting...\n", PEGATRON_WMI_GUID);
+		return -EIO;
+	}
+
+	status = wmi_install_notify_handler(PEGATRON_WMI_EVENT_GUID, pegatron_notify_handler, pegatron);
+	if(ACPI_FAILURE(status)) {
+		pr_err("[Pegatron] Error installing event notify handler for GUID: %s\
+						. Exiting...\n", PEGATRON_WMI_EVENT_GUID);
+		return -EIO;
+	}
+
+	pr_info("[Pegatron] WMI notify handlers installed successfully\n");
+
+	return 0;
+}
+
 /*
  * init functions
  */
 
+
 static int pegatron_acpi_init(struct pegatron_laptop *pegatron) {
 	acpi_status status = AE_OK;
+	int error;
+
+	pr_info("[Pegatron] Initializing acpi data\n");
 
 	if (!acpi_has_method(pegatron->handle, "INIT")){
 		dev_err(&pegatron->dev->dev, "[Pegatron] INIT method not found on DSDT\n");
@@ -161,6 +191,14 @@ static int pegatron_acpi_init(struct pegatron_laptop *pegatron) {
 		return -ENODEV;
 	}
 
+	error = pegatron_install_wmi_handlers(pegatron);
+
+	if (error) {
+		dev_err(&pegatron->dev->dev, "[Pegatron] failed to initialize ACPI data\n");
+		return error;
+	}
+
+	pr_info("[Pegatron] acpi data initialized successfully\n");
 	return 0;
 }
 
@@ -268,6 +306,9 @@ static void pegatron_input_exit(struct pegatron_laptop *pegatron) {
 /*
  * MISC functions
  */
+
+
+
 static int pegatron_wlan_set_status(struct pegatron_laptop *pegatron,
 									enum pegatron_wlan_led_status led_status) {
 	acpi_status status;
@@ -361,26 +402,48 @@ static int pegatron_acpi_add(struct acpi_device *dev) {
 static int pegatron_query_hotkey(const struct pegatron_laptop* pegatron
 				, const int event, unsigned int *scancode) {
 
+	static DEFINE_MUTEX(query_lock);
+
 	acpi_status status = AE_OK;
 	unsigned long long *data = kzalloc(sizeof(unsigned long long int),
 									  GFP_KERNEL);
+
+	if (!pegatron) {
+		pr_info("[Pegatron] could not query last hot key pressed,\
+					   	laptop info is NULL\n");
+		kfree(data);
+		return -EINVAL;
+	}
+
+	if (!pegatron) {
+		pr_info("[Pegatron] could not query last hot key pressed\
+					no ACPI handler found\n");
+		kfree(data);
+		return -EINVAL;
+	}
 
 	if (!data) {
 		dev_err(&pegatron->dev->dev, "[Pegatron] No memory enough\n");
 		return -ENOMEM;
 	}
 
-	if (!acpi_has_method(pegatron->handle, "WQ00")) {
+	if (!acpi_has_method(pegatron->handle, "\\WMI0.WQ00")) {
 		dev_err(&pegatron->dev->dev,
 				"[Pegatron] Could not find required function in ACPI table\n");
 		kfree(data);
 		return -ENODEV;
 	}
 
-	status = acpi_evaluate_integer(pegatron->handle, "WQ00", NULL, data);
+	/* As WMI do not seralize access to WQ00 function on AML code
+	 * we should lock the access here, otherwise not expected results can arise from
+	 * this call
+	 */
+	mutex_lock(&query_lock);
+	status = acpi_evaluate_integer(pegatron->handle, "\\WMI0.WQ00", NULL, data);
+	mutex_unlock(&query_lock);
 
 	if (ACPI_FAILURE(status)){
-		dev_err(&pegatron->dev->dev, "[Pegatron] error calling ACPI INIT method\n");
+		dev_err(&pegatron->dev->dev, "[Pegatron] error querying hotkey\n");
 		kfree(data);
 		return -ENODEV;
 	}
@@ -396,9 +459,14 @@ static int pegatron_query_hotkey(const struct pegatron_laptop* pegatron
 
 static void pegatron_input_notify(struct pegatron_laptop *pegatron, u32 event) {
 		int wlan_on = -1;
+		int scancode = -1;
 		if (!pegatron->inputdev)
 				return;
-
+		
+		/* WLAN event is handled on a different way on DSDT by AML code
+		 * so we need to handle it as and special/different event than
+		 * all the other caming from any hotkey
+		*/
 		switch (event){
 			case PEGATRON_WLAN_EVENT:
 				if (pegatron->wlan_rfkill.status == 1){
@@ -408,7 +476,9 @@ static void pegatron_input_notify(struct pegatron_laptop *pegatron, u32 event) {
 				}
 				break;
 			default:
-				if (!sparse_keymap_report_event(pegatron->inputdev, event, 1, true)) {
+				pegatron_query_hotkey(pegatron, event, &scancode);
+
+				if (!sparse_keymap_report_event(pegatron->inputdev, scancode, 1, true)) {
 						pr_info("[Pegatron] Unknown key %x pressed\n", event);
 				}else{
 						pr_info("[Pegatron] to be done in input notify\n");
@@ -428,8 +498,8 @@ static void pegatron_notify_handler(u32 value, void *context) {
 		struct acpi_buffer response = { ACPI_ALLOCATE_BUFFER, NULL };
 		union acpi_object *obj;
 		acpi_status status;
-		int code;
-		/*struct pegatron_laptop *laptop = */
+		int code, scancode;
+		struct pegatron_laptop *pegatron = context;
 
 		pr_info("[Pegatron] event received\n");
 
@@ -454,7 +524,13 @@ static void pegatron_notify_handler(u32 value, void *context) {
 				pr_info("[Pegatron] wlan event received\n");
 				break;
 			default:
-				pr_info("[Pegatron] operation not implemented yet\n");
+				pegatron_query_hotkey((struct pegatron_laptop*)context, code, &scancode);
+
+				if (!sparse_keymap_report_event(pegatron->inputdev, scancode, 1, true)) {
+						pr_info("[Pegatron] Unknown key %x pressed\n", scancode);
+				}else{
+						pr_info("[Pegatron] to be done in input notify\n");
+				}
 				break;
 		}
 
@@ -498,10 +574,6 @@ static int pegatron_start_wmi(void) {
 		return 0;
 }
 
-static void pegatron_rfkill_query(struct rfkill *rkfill, void *data) {
-
-}
-
 static int pegatron_wlan_rfkill_set_block(void *data, bool blocked) {
 	struct pegatron_laptop *pegatron = data;
 
@@ -543,18 +615,7 @@ static int __init pegatron_laptop_init(void) {
 
 	pr_info("[Pegatron] Installing WMI event handler\n");
 
-	status = wmi_install_notify_handler(PEGATRON_WMI_GUID, pegatron_notify_handler, NULL);
-
-	if(ACPI_FAILURE(status)) {
-		pr_err("[Pegatron] Error installing notify handler. Exiting...\n");
-		return -EIO;
-	}
-
-	status = wmi_install_notify_handler(PEGATRON_WMI_EVENT_GUID, pegatron_notify_handler, NULL);
-	if(ACPI_FAILURE(status)) {
-		pr_err("[Pegatron] Error installing event notify handler. Exiting...\n");
-		return -EIO;
-	}
+	
 	
 	pegatron_start_wmi();
 
