@@ -307,7 +307,9 @@ static void pegatron_input_exit(struct pegatron_laptop *pegatron) {
  * MISC functions
  */
 
-
+static int pegatron_send_uevent(struct pegatron_laptop *pegatron) {
+	return kobject_uevent(&pegatron->inputdev->dev.kobj, KOBJ_CHANGE);
+}
 
 static int pegatron_wlan_set_status(struct pegatron_laptop *pegatron,
 									enum pegatron_wlan_led_status led_status) {
@@ -450,15 +452,12 @@ static int pegatron_query_hotkey(const struct pegatron_laptop* pegatron
 
 	*scancode = *(data);
 
-	pr_info("[Pegatron] Event scancode: 0x%x\n", *scancode);
-
 	kfree(data);
 
 	return 0;
 }
 
 static void pegatron_input_notify(struct pegatron_laptop *pegatron, u32 event) {
-		int wlan_on = -1;
 		int scancode = -1;
 		if (!pegatron->inputdev)
 				return;
@@ -481,7 +480,7 @@ static void pegatron_input_notify(struct pegatron_laptop *pegatron, u32 event) {
 				if (!sparse_keymap_report_event(pegatron->inputdev, scancode, 1, true)) {
 						pr_info("[Pegatron] Unknown key %x pressed\n", event);
 				}else{
-						pr_info("[Pegatron] to be done in input notify\n");
+						pegatron_send_uevent(pegatron);
 				}
 				break;
 		}
@@ -489,8 +488,6 @@ static void pegatron_input_notify(struct pegatron_laptop *pegatron, u32 event) {
 
 static void pegatron_acpi_notify(struct acpi_device *dev, u32 event) {
 		struct pegatron_laptop *pegatron = acpi_driver_data(dev);
-		pr_info("[Pegatron] event triggered: %x\n", event);
-
 		pegatron_input_notify(pegatron, event);
 }
 
@@ -498,10 +495,8 @@ static void pegatron_notify_handler(u32 value, void *context) {
 		struct acpi_buffer response = { ACPI_ALLOCATE_BUFFER, NULL };
 		union acpi_object *obj;
 		acpi_status status;
-		int code, scancode;
+		int code = -1, scancode;
 		struct pegatron_laptop *pegatron = context;
-
-		pr_info("[Pegatron] event received\n");
 
 		status = wmi_get_event_data(value, &response);
 
@@ -514,10 +509,7 @@ static void pegatron_notify_handler(u32 value, void *context) {
 
 		if (obj && obj->type == ACPI_TYPE_INTEGER) {
 			code = obj->integer.value;
-			
-			pr_info("[Pegatron] received key event: %x\n", code);
-
-		}
+		
 
 		switch (code) {
 			case PEGATRON_WLAN_EVENT:
@@ -528,13 +520,13 @@ static void pegatron_notify_handler(u32 value, void *context) {
 
 				if (!sparse_keymap_report_event(pegatron->inputdev, scancode, 1, true)) {
 						pr_info("[Pegatron] Unknown key %x pressed\n", scancode);
-				}else{
-						pr_info("[Pegatron] to be done in input notify\n");
 				}
+
 				break;
 		}
 
 		kfree(obj);
+	}
 }
 
 static int pegatron_acpi_remove(struct acpi_device *dev) {
@@ -591,7 +583,6 @@ static int pegatron_wlan_rfkill_set_block(void *data, bool blocked) {
 
 static int __init pegatron_laptop_init(void) {
 	int result = 0;
-	acpi_status status = AE_OK;
 
 	pr_info("[Pegatron] ACPI/WMI module loaded(GUID: %s)\n", PEGATRON_WMI_GUID);
 
@@ -612,10 +603,6 @@ static int __init pegatron_laptop_init(void) {
 		pr_err("[Pegatron] WMI information doesn't match. Exiting...\n");
 		return -ENODEV;
 	}
-
-	pr_info("[Pegatron] Installing WMI event handler\n");
-
-	
 	
 	pegatron_start_wmi();
 
