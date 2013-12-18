@@ -409,6 +409,18 @@ static int pegatron_query_hotkey(const struct pegatron_laptop* pegatron
 	acpi_status status = AE_OK;
 	unsigned long long *data = kzalloc(sizeof(unsigned long long int),
 									  GFP_KERNEL);
+	union acpi_object obj[1];
+	struct acpi_object_list args;
+
+	/* We send out a dummy parameter to ACPI as it requries on AML's code
+	 * method definition, even without handle it */
+
+	obj[0].type = ACPI_TYPE_INTEGER;
+	obj[0].integer.value = 0x0;  
+
+	args.count = 1;
+	args.pointer = obj;
+
 
 	if (!pegatron) {
 		pr_info("[Pegatron] could not query last hot key pressed,\
@@ -441,7 +453,7 @@ static int pegatron_query_hotkey(const struct pegatron_laptop* pegatron
 	 * this call
 	 */
 	mutex_lock(&query_lock);
-	status = acpi_evaluate_integer(pegatron->handle, "\\WMI0.WQ00", NULL, data);
+	status = acpi_evaluate_integer(pegatron->handle, "\\WMI0.WQ00", &args, data);
 	mutex_unlock(&query_lock);
 
 	if (ACPI_FAILURE(status)){
