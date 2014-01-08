@@ -32,6 +32,7 @@
 #define PEGATRON_WMI_EVENT_GUID "59142400-C6A3-40FA-BADB-8A2652834100"
 
 
+#define PEGATRON_ACPI_INIT_CODE 0x55AA66BB
 #define PEGATRON_WLAN_EVENT 0x88
 
 /* WLAN status on ACPI function */
@@ -62,7 +63,7 @@ MODULE_DEVICE_TABLE(acpi, pegatron_device_ids);
 static const struct key_entry pegatron_keymap[] = {
 	{KE_KEY, 0xf1, {KEY_WLAN} }, /* WLAN on/off hotkey */
 	{KE_KEY, 0x102, {KEY_PROG2} }, /* Smart battery hotkey */
-	{KE_KEY, 0x103, {KEY_TOUCHPAD_TOGGLE} }, /* TouchPad lock hotkey */
+	{KE_KEY, 0x108, {KEY_TOUCHPAD_TOGGLE} }, /* TouchPad lock hotkey */
 	{KE_END, 0},
 };
 
@@ -71,6 +72,10 @@ typedef enum pegatron_wlan_led_status {
 	PEGATRON_WLAN_LED_ON = 0x1
 }pegatron_wlan_led_status;
 
+typedef enum pegatron_touchpad_status {
+	PEGATRON_TOUCHPAD_ON = 0x1,
+	PEGATRON_TOUCHPAD_OFF = 0x0
+}pegatron_touchpad_status;
 
 /*
  * Wlan rfkill information
@@ -179,13 +184,8 @@ static int pegatron_acpi_init(struct pegatron_laptop *pegatron) {
 		return -ENODEV;
 	}
 
-	status = acpi_execute_simple_method(pegatron->handle, "INIT", 0x55AA66BC);
-	if (ACPI_FAILURE(status)){
-		dev_err(&pegatron->dev->dev, "[Pegatron] error calling ACPI INIT method\n");
-		return -ENODEV;
-	}
-
-	status = acpi_execute_simple_method(pegatron->handle, "NTFY", 0x02);
+	status = acpi_execute_simple_method(pegatron->handle, "INIT",
+										PEGATRON_ACPI_INIT_CODE);
 	if (ACPI_FAILURE(status)){
 		dev_err(&pegatron->dev->dev, "[Pegatron] error calling ACPI INIT method\n");
 		return -ENODEV;
@@ -489,6 +489,8 @@ static void pegatron_input_notify(struct pegatron_laptop *pegatron, u32 event) {
 			default:
 				pegatron_query_hotkey(pegatron, event, &scancode);
 
+				pr_info("[Pegatron debug] input notify called: %d\n", event);
+
 				if (!sparse_keymap_report_event(pegatron->inputdev, scancode, 1, true)) {
 						pr_info("[Pegatron] Unknown key %x pressed\n", event);
 				}else{
@@ -521,32 +523,21 @@ static void pegatron_notify_handler(u32 value, void *context) {
 
 		if (obj && obj->type == ACPI_TYPE_INTEGER) {
 			code = obj->integer.value;
-		
 
-		switch (code) {
-			case PEGATRON_WLAN_EVENT:
-				pr_info("[Pegatron] wlan event received\n");
-				break;
-			default:
-				pegatron_query_hotkey((struct pegatron_laptop*)context, code, &scancode);
+			pegatron_query_hotkey((struct pegatron_laptop*)context, code, &scancode);
 
-				if (!sparse_keymap_report_event(pegatron->inputdev, scancode, 1, true)) {
-						pr_info("[Pegatron] Unknown key %x pressed\n", scancode);
-				}
-
-				break;
+			if (!sparse_keymap_report_event(pegatron->inputdev, scancode, 1, true)) {
+				pr_info("[Pegatron] Unknown key %x pressed\n", scancode);
+			}
+			
+			kfree(obj);
 		}
-
-		kfree(obj);
-	}
 }
 
 static int pegatron_acpi_remove(struct acpi_device *dev) {
 	struct pegatron_laptop *pegatron = acpi_driver_data(dev);
 
 	pr_info("[Pegatron] removing acpi data\n");
-	
-	/* TODO: exit all other stuff to be done */
 
 	pegatron_input_exit(pegatron);
 
@@ -556,26 +547,6 @@ static int pegatron_acpi_remove(struct acpi_device *dev) {
 	kfree(pegatron);
 	
 	return 0;
-}
-
-
-static int pegatron_start_wmi(void) {
-		struct bios_args args = {
-			.arg0 = 0x1,
-		};
-
-		struct acpi_buffer input = { (acpi_size) sizeof(args), &args };
-		struct acpi_buffer output = { ACPI_ALLOCATE_BUFFER, NULL };
-		acpi_status status;
-
-		status = wmi_evaluate_method(PEGATRON_WMI_GUID, 0x01, 0x06, &input, &output);
-
-		if (ACPI_FAILURE(status)) {
-			pr_err("[Pegatron] unable to find this method\n");
-			return -1;
-		}
-
-		return 0;
 }
 
 static int pegatron_wlan_rfkill_set_block(void *data, bool blocked) {
@@ -591,7 +562,6 @@ static int pegatron_wlan_rfkill_set_block(void *data, bool blocked) {
 }
 
 /*****************************************************************************/
-
 
 static int __init pegatron_laptop_init(void) {
 	int result = 0;
@@ -615,8 +585,6 @@ static int __init pegatron_laptop_init(void) {
 		pr_err("[Pegatron] WMI information doesn't match. Exiting...\n");
 		return -ENODEV;
 	}
-	
-	pegatron_start_wmi();
 
 	pr_info("[Pegatron] Module initialized successfully\n");
 	return 0;
