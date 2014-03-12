@@ -1,0 +1,7 @@
+--- linux-3.13.6/drivers/platform/x86/Makefile	2014-03-07 03:07:02.000000000 -0300
++++ linux-3.13.6-devel/drivers/platform/x86/Makefile	2014-03-12 15:55:22.723466181 -0300
+@@ -54,3 +54,4 @@
+ obj-$(CONFIG_INTEL_SMARTCONNECT)	+= intel-smartconnect.o
+ 
+ obj-$(CONFIG_PVPANIC)           += pvpanic.o
++obj-$(CONFIG_PEGATRON_LAPTOP)	+= pegatron-laptop.o

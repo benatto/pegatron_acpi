@@ -1,0 +1,16 @@
+--- linux-3.13.6/drivers/platform/x86/Kconfig	2014-03-07 03:07:02.000000000 -0300
++++ linux-3.13.6-devel/drivers/platform/x86/Kconfig	2014-03-12 15:54:12.747079953 -0300
+@@ -808,4 +808,13 @@
+ 	  a paravirtualized device provided by QEMU; it lets a virtual machine
+ 	  (guest) communicate panic events to the host.
+ 
++config PEGATRON_LAPTOP
++	tristate "Pegatron ACPI device support"
++	depends on ACPI
++	depends on INPUT
++	depends on RFKILL
++	select INPUT_SPARSEKMAP
++	---help---
++	 This is a driver for Pegatron laptop.
++
+ endif # X86_PLATFORM_DEVICES

@@ -1,0 +1,638 @@
+--- linux-3.13.6/drivers/platform/x86/pegatron-laptop.c	1969-12-31 21:00:00.000000000 -0300
++++ linux-3.13.6-devel/drivers/platform/x86/pegatron-laptop.c	2014-03-12 15:51:32.987198321 -0300
+@@ -0,0 +1,635 @@
++/*
++ * ACPI-WMI driver for Pegatron platform
++ *
++ * Copyright (C) 2013 Marco Antonio Benatto <benatto@mandriva.com.br>
++ *
++ * Development of this program was funded by Philco Informática.
++ * Most of this driver was written following the ACPI specification provided
++ * by Pegatron Corp.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of GNU General Public License version 2 as
++ * published by Free Software Foundation
++ *
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/types.h>
++#include <linux/printk.h>
++#include <linux/rfkill.h>
++#include <linux/input.h>
++#include <linux/input/sparse-keymap.h>
++#include <linux/platform_device.h>
++#include <acpi/acpi_bus.h>
++#include <acpi/acpi_drivers.h>
++
++#define PEGATRON_DEVICE_ID "PTK0001"
++#define PEGATRON_FILE KBUILD_MODNAME
++
++#define PEGATRON_WMI_GUID "79142400-C6A3-40FA-BADB-8A2652834100"
++#define PEGATRON_WMI_EVENT_GUID "59142400-C6A3-40FA-BADB-8A2652834100"
++
++#define PEGATRON_ACPI_INIT_CODE 0x55AA66BB
++#define PEGATRON_WLAN_EVENT 0x88
++
++/* WLAN status on ACPI function */
++#define PEGATRON_ACPI_WLAN_ST "HSWC"
++
++
++MODULE_AUTHOR("Marco Antonio Benatto");
++MODULE_DESCRIPTION("Pegatron ACPI/WMI platform device driver");
++MODULE_LICENSE("GPL");
++
++MODULE_ALIAS("wmi:79142400-C6A3-40FA-BADB-8A2652834100");
++
++static int pegatron_acpi_add(struct acpi_device*);
++static int pegatron_acpi_remove(struct acpi_device*);
++static void pegatron_acpi_notify(struct acpi_device*, u32);
++static int pegatron_wlan_rfkill_set_block(void*, bool);
++static void pegatron_notify_handler(u32, void *);
++
++static const struct acpi_device_id pegatron_device_ids[] = {
++	{ PEGATRON_DEVICE_ID, 0 },
++	{ "", 0}
++};
++MODULE_DEVICE_TABLE(acpi, pegatron_device_ids);
++
++/*
++ * Pegatron specific hotkeys mapping
++ */
++static const struct key_entry pegatron_keymap[] = {
++	{KE_KEY, 0xf1, {KEY_WLAN} }, /* WLAN on/off hotkey */
++	{KE_KEY, 0x102, {KEY_PROG2} }, /* Smart battery hotkey */
++	{KE_KEY, 0x108, {KEY_TOUCHPAD_TOGGLE} }, /* TouchPad lock hotkey */
++	{KE_END, 0},
++};
++
++typedef enum pegatron_wlan_led_status {
++	PEGATRON_WLAN_LED_OFF = 0x0,
++	PEGATRON_WLAN_LED_ON = 0x1
++}pegatron_wlan_led_status;
++
++/*
++ * Wlan rfkill information
++ */
++struct pegatron_rfkill_info {
++	struct rfkill *rfkill;
++	u32 dev_id;
++	int status;
++};
++
++/*
++ * Pegatron laptop information
++ */
++
++struct pegatron_laptop {
++	struct acpi_device *dev;
++
++	struct input_dev *inputdev; /* Pegatron input device */
++	struct key_entry *keymap; /* Pegatron hotkeys sparse keymap */
++
++	acpi_handle handle;	
++
++	struct pegatron_rfkill_info wlan_rfkill; /* wlan rfkill information */
++
++	struct mutex hotplug_lock; 
++	struct mutex wmi_lock;
++};
++
++/*
++ * BIOS argument struct
++ */
++struct bios_args {
++	u32 arg0;
++};
++
++static int pegatron_wlan_set_status(struct pegatron_laptop *, pegatron_wlan_led_status);
++
++/*
++ * Pegatron ACPI driver information
++ */
++
++static struct acpi_driver pegatron_acpi_driver = {
++	.name =			"Pegatron ACPI",
++	.class = 		"Pegatron",
++	.ids = 			pegatron_device_ids,
++	.flags =		ACPI_DRIVER_ALL_NOTIFY_EVENTS,
++	.ops =			{
++						.add = pegatron_acpi_add,
++						.remove = pegatron_acpi_remove,
++						.notify = pegatron_acpi_notify,
++					},
++	.owner =		THIS_MODULE,
++};
++
++static struct platform_driver platform_driver = {
++		.driver = {
++			.name = PEGATRON_FILE,
++			.owner = THIS_MODULE,
++		},
++};
++
++
++static const struct rfkill_ops pegatron_rfk_ops = {
++	.set_block = pegatron_wlan_rfkill_set_block,
++};
++
++
++static int pegatron_install_wmi_handlers(struct pegatron_laptop *pegatron) {
++	acpi_status status;
++
++	pr_info("[Pegatron] Installing WMI notify handlers...\n");
++
++	status = wmi_install_notify_handler(PEGATRON_WMI_GUID, pegatron_notify_handler, pegatron);
++
++	if(ACPI_FAILURE(status)) {
++		pr_err("[Pegatron] Error installing notify handleri for GUID: %s\
++						. Exiting...\n", PEGATRON_WMI_GUID);
++		return -EIO;
++	}
++
++	status = wmi_install_notify_handler(PEGATRON_WMI_EVENT_GUID, pegatron_notify_handler, pegatron);
++	if(ACPI_FAILURE(status)) {
++		pr_err("[Pegatron] Error installing event notify handler for GUID: %s\
++						. Exiting...\n", PEGATRON_WMI_EVENT_GUID);
++		return -EIO;
++	}
++
++	pr_info("[Pegatron] WMI notify handlers installed successfully\n");
++
++	return 0;
++}
++
++/*
++ * init functions
++ */
++
++
++static int pegatron_acpi_init(struct pegatron_laptop *pegatron) {
++	acpi_status status = AE_OK;
++	int error;
++
++	pr_info("[Pegatron] Initializing acpi data\n");
++
++	if (!acpi_has_method(pegatron->handle, "INIT")){
++		dev_err(&pegatron->dev->dev, "[Pegatron] INIT method not found on DSDT\n");
++		return -ENODEV;
++	}
++
++	status = acpi_execute_simple_method(pegatron->handle, "INIT", PEGATRON_ACPI_INIT_CODE);
++	if (ACPI_FAILURE(status)){
++		dev_err(&pegatron->dev->dev, "[Pegatron] error calling ACPI INIT method\n");
++		return -ENODEV;
++	}
++
++	status = acpi_execute_simple_method(pegatron->handle, "NTFY", 0x02);
++	if (ACPI_FAILURE(status)){
++		dev_err(&pegatron->dev->dev, "[Pegatron] error calling ACPI INIT method\n");
++		return -ENODEV;
++	}
++
++	error = pegatron_install_wmi_handlers(pegatron);
++
++	if (error) {
++		dev_err(&pegatron->dev->dev, "[Pegatron] failed to initialize ACPI data\n");
++		return error;
++	}
++
++	pr_info("[Pegatron] acpi data initialized successfully\n");
++	return 0;
++}
++
++static int pegatron_input_init(struct pegatron_laptop *pegatron) {
++	struct input_dev *input;
++	int failed;
++
++	pr_info("[Pegatron] Initializing input devices\n");
++
++	input = input_allocate_device();
++
++	if (!input){
++		pr_warn("[Pegatron] Failed to allocate input device\n");
++		return -ENOMEM;
++	}
++
++	input->name = "Pegatron laptop extra buttons";
++	input->phys = PEGATRON_FILE "/input0";
++	input->id.bustype = BUS_HOST;
++	
++	/*Generic device from Pegatron ACPI device*/
++	input->dev.parent = &pegatron->dev->dev; 
++	
++	/* Setting up sparse keymap */
++	failed = sparse_keymap_setup(input, pegatron_keymap, NULL);
++
++	if (failed) {
++		pr_warn("[Pegatron] Unable to setup Pegatron keymap\n");
++		input_free_device(input);
++		return failed;
++	}
++
++	failed = input_register_device(input);
++
++	if (failed) {
++		pr_warn("[Pegatron] Unable to register Pegatron input\n");
++		sparse_keymap_free(input);
++		input_free_device(input);
++		return failed;
++	}
++
++	pegatron->inputdev = input;
++	
++	return 0;
++}
++
++static int pegatron_rfkill_init(struct pegatron_laptop *pegatron) {
++	int result = 0;
++
++	pegatron->wlan_rfkill.rfkill = rfkill_alloc("Pegatron WLAN",
++												&pegatron->dev->dev,
++												RFKILL_TYPE_WLAN,
++												&pegatron_rfk_ops,
++												pegatron);
++
++	if (!pegatron->wlan_rfkill.rfkill) {
++		dev_err(&pegatron->dev->dev, "[Pegatron] Error allocating rfkill \
++									  device\n");
++		return -ENOMEM;
++	}
++
++	
++	/* We start WLAN switches as both unblocked by default */
++	rfkill_init_sw_state(pegatron->wlan_rfkill.rfkill, false);
++	rfkill_set_hw_state(pegatron->wlan_rfkill.rfkill, false);
++
++	/* Set control variable from WLAN as "ON" */
++	pegatron->wlan_rfkill.status = 1;
++
++	pr_info("[Pegatron] Trying to register rfkill driver\n");
++	result = rfkill_register(pegatron->wlan_rfkill.rfkill);
++
++	if (result < 0) {
++		dev_err(&pegatron->dev->dev, "[Pegatron] failed to register rfkill driver: %d\n", result);
++		rfkill_destroy(pegatron->wlan_rfkill.rfkill);
++		return result;
++	}
++
++	pr_info("[Pegatron] rfkill driver registered successfully\n");
++
++	return 0;
++}
++
++
++/*****************************************************************************/
++
++
++
++/*
++ * exit functions
++ */
++
++static void pegatron_input_exit(struct pegatron_laptop *pegatron) {
++	if (pegatron->inputdev) {
++		sparse_keymap_free(pegatron->inputdev);
++		input_unregister_device(pegatron->inputdev);
++	}
++
++	pegatron->inputdev = NULL;
++}
++
++/*****************************************************************************/
++
++
++/*
++ * MISC functions
++ */
++
++static int pegatron_send_uevent(struct pegatron_laptop *pegatron) {
++	return kobject_uevent(&pegatron->inputdev->dev.kobj, KOBJ_CHANGE);
++}
++
++
++static int pegatron_wlan_set_status(struct pegatron_laptop *pegatron,
++									enum pegatron_wlan_led_status led_status) {
++	acpi_status status;
++	union acpi_object obj[1];
++	struct acpi_object_list args;
++	unsigned long long error;
++
++	obj[0].type = ACPI_TYPE_INTEGER;
++	obj[0].integer.value = led_status;  /* query value defined into DSDT */
++
++	args.count = 1;
++	args.pointer = obj;
++
++	if (!acpi_has_method(pegatron->handle, PEGATRON_ACPI_WLAN_ST)) {
++		dev_err(&pegatron->dev->dev,
++				"[Pegatron] Unable to evaluate WLAN status\n");
++		return -ENODEV;
++	}
++
++	/* rfkill functions works on the other hand of this function logic
++	 * so if we set led to ON we need to set block to false and vice-versa
++	 */
++	rfkill_set_hw_state(pegatron->wlan_rfkill.rfkill,
++				   		led_status == PEGATRON_WLAN_LED_ON ? false : true);
++					   	
++
++	status = acpi_evaluate_integer(pegatron->handle, PEGATRON_ACPI_WLAN_ST,
++								   &args, &error);
++
++	if (ACPI_FAILURE(status)) {
++		dev_err(&pegatron->dev->dev, 
++				"[Pegatron] Error trying to evaluate WLAN status\n");
++		return -EIO;
++	}
++
++	if (error) {
++		dev_err(&pegatron->dev->dev,
++			"[Pegatron] Error trying to set WLAN led status\n");
++		return -EIO;
++	}
++	
++
++	pegatron->wlan_rfkill.status = (int)led_status;
++
++	return 0;
++}
++
++static int pegatron_acpi_add(struct acpi_device *dev) {
++	struct pegatron_laptop *pegatron;
++	int result;
++
++	pegatron = kzalloc(sizeof(struct pegatron_laptop), GFP_KERNEL);
++
++	if (!pegatron){
++		dev_err(&dev->dev, "[Pegatron] Error allocating memory for pegatron laptop\n");
++		return -ENOMEM;
++	}
++
++	pegatron->handle = dev->handle;
++	dev->driver_data = pegatron;
++	pegatron->dev = dev;
++
++	/* Initializing acpi */
++	result = pegatron_acpi_init(pegatron);
++
++	/* If we fail to init something we release allocated memory */
++	if (result) {
++		kfree(pegatron);
++		return result;
++	}
++
++	/* Initializing Pegatron specific input device */
++	result = pegatron_input_init(pegatron);
++
++	if (result) {
++		kfree(pegatron);
++		return result;
++	}
++
++	/* Initializing rfkill switches*/
++	result = pegatron_rfkill_init(pegatron);
++
++	if (result) {
++		kfree(pegatron);
++		return result;
++	}
++	
++	return result;
++}
++
++static int pegatron_query_hotkey(const struct pegatron_laptop* pegatron
++				, const int event, unsigned int *scancode) {
++
++	static DEFINE_MUTEX(query_lock);
++
++	acpi_status status = AE_OK;
++	unsigned long long *data = kzalloc(sizeof(unsigned long long int),
++									  GFP_KERNEL);
++	union acpi_object obj[1];
++	struct acpi_object_list args;
++
++	/* We send out a dummy parameter to ACPI as it requries on AML's code
++	 * method definition, even without handle it */
++
++	obj[0].type = ACPI_TYPE_INTEGER;
++	obj[0].integer.value = 0x0;  
++
++	args.count = 1;
++	args.pointer = obj;
++
++
++	if (!pegatron) {
++		pr_info("[Pegatron] could not query last hot key pressed,\
++					   	laptop info is NULL\n");
++		kfree(data);
++		return -EINVAL;
++	}
++
++	if (!pegatron) {
++		pr_info("[Pegatron] could not query last hot key pressed\
++					no ACPI handler found\n");
++		kfree(data);
++		return -EINVAL;
++	}
++
++	if (!data) {
++		dev_err(&pegatron->dev->dev, "[Pegatron] No memory enough\n");
++		return -ENOMEM;
++	}
++
++	if (!acpi_has_method(pegatron->handle, "\\WMI0.WQ00")) {
++		dev_err(&pegatron->dev->dev,
++				"[Pegatron] Could not find required function in ACPI table\n");
++		kfree(data);
++		return -ENODEV;
++	}
++
++	/* As WMI do not seralize access to WQ00 function on AML code
++	 * we should lock the access here, otherwise not expected results can arise from
++	 * this call
++	 */
++	mutex_lock(&query_lock);
++	status = acpi_evaluate_integer(pegatron->handle, "\\WMI0.WQ00", &args, data);
++	mutex_unlock(&query_lock);
++
++	if (ACPI_FAILURE(status)){
++		dev_err(&pegatron->dev->dev, "[Pegatron] error querying hotkey\n");
++		kfree(data);
++		return -ENODEV;
++	}
++
++	*scancode = *(data);
++
++	kfree(data);
++
++	return 0;
++}
++
++static void pegatron_input_notify(struct pegatron_laptop *pegatron, u32 event) {
++		int scancode = -1;
++		if (!pegatron->inputdev)
++				return;
++		
++		/* WLAN event is handled on a different way on DSDT by AML code
++		 * so we need to handle it as and special/different event than
++		 * all the other caming from any hotkey
++		*/
++		switch (event){
++			case PEGATRON_WLAN_EVENT:
++				if (pegatron->wlan_rfkill.status == 1){
++					pegatron_wlan_set_status(pegatron, PEGATRON_WLAN_LED_OFF);
++				}else{
++					pegatron_wlan_set_status(pegatron, PEGATRON_WLAN_LED_ON);
++				}
++				break;
++			default:
++				pegatron_query_hotkey(pegatron, event, &scancode);
++
++				if (!sparse_keymap_report_event(pegatron->inputdev, scancode, 1, true)) {
++						pr_info("[Pegatron] Unknown key %x pressed\n", event);
++				}else{
++						pegatron_send_uevent(pegatron);
++				}
++				break;
++		}
++}
++
++static void pegatron_acpi_notify(struct acpi_device *dev, u32 event) {
++		struct pegatron_laptop *pegatron = acpi_driver_data(dev);
++		pegatron_input_notify(pegatron, event);
++}
++
++static void pegatron_notify_handler(u32 value, void *context) {
++		struct acpi_buffer response = { ACPI_ALLOCATE_BUFFER, NULL };
++		union acpi_object *obj;
++		acpi_status status;
++		int code = -1, scancode;
++		struct pegatron_laptop *pegatron = context;
++
++		status = wmi_get_event_data(value, &response);
++
++		if (status != AE_OK) {
++			pr_err("[Pegatron] bad event status 0x%x\n", status);
++			return;
++		}
++
++		obj = (union acpi_object*)response.pointer;
++
++		if (obj && obj->type == ACPI_TYPE_INTEGER) {
++			code = obj->integer.value;
++		
++
++		switch (code) {
++			case PEGATRON_WLAN_EVENT:
++				pr_info("[Pegatron] wlan event received\n");
++				break;
++			default:
++				pegatron_query_hotkey((struct pegatron_laptop*)context, code, &scancode);
++
++				if (!sparse_keymap_report_event(pegatron->inputdev, scancode, 1, true)) {
++						pr_info("[Pegatron] Unknown key %x pressed\n", scancode);
++				}
++
++				break;
++		}
++
++		kfree(obj);
++	}
++}
++
++static int pegatron_acpi_remove(struct acpi_device *dev) {
++	struct pegatron_laptop *pegatron = acpi_driver_data(dev);
++
++	pr_info("[Pegatron] removing acpi data\n");
++	
++	/* TODO: exit all other stuff to be done */
++
++	pegatron_input_exit(pegatron);
++
++	pr_info("[Pegatron] unregistering rfkill switches\n");
++	rfkill_unregister(pegatron->wlan_rfkill.rfkill);
++
++	kfree(pegatron);
++	
++	return 0;
++}
++
++
++static int pegatron_start_wmi(void) {
++		struct bios_args args = {
++			.arg0 = 0x1,
++		};
++
++		struct acpi_buffer input = { (acpi_size) sizeof(args), &args };
++		struct acpi_buffer output = { ACPI_ALLOCATE_BUFFER, NULL };
++		acpi_status status;
++
++		status = wmi_evaluate_method(PEGATRON_WMI_GUID, 0x01, 0x06, &input, &output);
++
++		if (ACPI_FAILURE(status)) {
++			pr_err("[Pegatron] unable to find this method\n");
++			return -1;
++		}
++
++		return 0;
++}
++
++static int pegatron_wlan_rfkill_set_block(void *data, bool blocked) {
++	struct pegatron_laptop *pegatron = data;
++
++	if (blocked) {
++		pegatron->wlan_rfkill.status = 0;
++		return pegatron_wlan_set_status(pegatron, PEGATRON_WLAN_LED_OFF);
++	}else{
++		pegatron->wlan_rfkill.status = 1;
++		return pegatron_wlan_set_status(pegatron, PEGATRON_WLAN_LED_ON);
++	}
++}
++
++/*****************************************************************************/
++
++
++static int __init pegatron_laptop_init(void) {
++	int result = 0;
++
++	pr_info("[Pegatron] ACPI/WMI module loaded(GUID: %s)\n", PEGATRON_WMI_GUID);
++
++	result = platform_driver_register(&platform_driver);
++	if (result < 0)
++			return result;
++
++	result = acpi_bus_register_driver(&pegatron_acpi_driver);
++	if (result < 0) {
++		pr_err("[Pegatron] Could not insert Pegatron device driver. Exiting...\n");
++		platform_driver_unregister(&platform_driver);
++		return -ENODEV;
++	}
++
++	pr_info("[Pegatron] Checking for WMI GUID information\n");
++
++	if (!wmi_has_guid(PEGATRON_WMI_GUID)) {
++		pr_err("[Pegatron] WMI information doesn't match. Exiting...\n");
++		return -ENODEV;
++	}
++	
++	pegatron_start_wmi();
++
++	pr_info("[Pegatron] Module initialized successfully\n");
++	return 0;
++}
++
++static void __exit pegatron_acpi_exit(void) {
++	pr_info("[Pegatron] Unloading ACPI/WMI device\n");
++	acpi_bus_unregister_driver(&pegatron_acpi_driver);
++	platform_driver_unregister(&platform_driver);
++	wmi_remove_notify_handler(PEGATRON_WMI_GUID);
++	wmi_remove_notify_handler(PEGATRON_WMI_EVENT_GUID);
++
++}
++
++module_init(pegatron_laptop_init);
++module_exit(pegatron_acpi_exit);
